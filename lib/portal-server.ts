@@ -3,6 +3,8 @@ import { getChatGPTUser } from '@/app/chatgpt-auth';
 import { z } from 'zod';
 import { dayISO, manager, statusLabels, type Person, type Ticket, type PortalState } from './portal-types';
 export function db(){if(!env.DB)throw new Error('Хранилище временно недоступно. Попробуйте позже.');return env.DB;}
+let extendedReady=false;
+async function ensureExtendedTables(){if(extendedReady)return;const database=db();await database.batch([database.prepare(`CREATE TABLE IF NOT EXISTS asset_inspections (id TEXT PRIMARY KEY,equipment_id TEXT NOT NULL,inspector_id TEXT NOT NULL,checklist TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,created_at TEXT NOT NULL)`),database.prepare('CREATE TABLE IF NOT EXISTS materials (id TEXT PRIMARY KEY,name TEXT NOT NULL,code TEXT NOT NULL UNIQUE,stock REAL NOT NULL DEFAULT 0,min_stock REAL NOT NULL DEFAULT 0,unit TEXT NOT NULL,updated_at TEXT NOT NULL)'),database.prepare('CREATE TABLE IF NOT EXISTS energy_readings (id TEXT PRIMARY KEY,location TEXT NOT NULL,reading_kwh REAL NOT NULL,recorded_at TEXT NOT NULL,author_id TEXT NOT NULL)'),database.prepare('CREATE TABLE IF NOT EXISTS work_permits (id TEXT PRIMARY KEY,number TEXT NOT NULL UNIQUE,location TEXT NOT NULL,work_type TEXT NOT NULL,status TEXT NOT NULL,responsible_id TEXT NOT NULL,valid_until TEXT NOT NULL,created_at TEXT NOT NULL)'),database.prepare('CREATE TABLE IF NOT EXISTS incidents (id TEXT PRIMARY KEY,title TEXT NOT NULL,location TEXT NOT NULL,severity TEXT NOT NULL,status TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL)')]);extendedReady=true;}
 export class PortalError extends Error{constructor(message:string,public status=400){super(message)}}
 export const emptyState:PortalState={viewer:null,me:null,people:[],tickets:[],equipment:[],plans:[],activity:[],attachments:[],firstRegistration:false};
 export async function identity(){const viewer=await getChatGPTUser();if(!viewer)throw new PortalError('Войдите через ChatGPT.',401);return viewer;}
@@ -10,7 +12,7 @@ export async function currentUser(){const v=await identity();const me=await db()
 export function canSee(me:Person,t:Ticket){return manager(me.role)||t.creator_id===me.id||me.role==='electrician'&&(t.assignee_id===me.id||!t.assignee_id);}
 export async function ticketFor(me:Person,id:string){const t=await db().prepare('SELECT * FROM tickets WHERE id=?').bind(id).first<Ticket>();if(!t||!canSee(me,t))throw new PortalError('Заявка не найдена.',404);return t;}
 export async function loadPortal():Promise<PortalState>{
- try{
+ try{await ensureExtendedTables();
   const viewer=await getChatGPTUser();if(!viewer)return emptyState;
   const database=db();const me=await database.prepare('SELECT * FROM users WHERE id=?').bind(viewer.userId).first<Person>();
   const base={...emptyState,viewer:{name:viewer.fullName??'',email:viewer.email},me};
@@ -45,6 +47,7 @@ async function validateRefs(equipmentId:string|null|undefined,assigneeId:string|
  if(assigneeId&&!await db().prepare("SELECT id FROM users WHERE id=? AND role='electrician'").bind(assigneeId).first())throw new PortalError('Выберите действующего электромонтёра.');
 }
 export async function mutate(action:string,input:unknown){
+ await ensureExtendedTables();
  const database=db(),now=new Date().toISOString();
  if(action==='register'){
   const viewer=await identity(),data=profile.parse(input);
@@ -112,6 +115,25 @@ export async function mutate(action:string,input:unknown){
   const stmts=[database.prepare('INSERT INTO plans (id,title,equipment_id,location,start_date,interval_days,occurrences,estimated_hours,assignee_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)').bind(pid,p.title,p.equipment_id,p.location,p.start_date,p.interval_days,p.occurrences,p.estimated_hours,p.assignee_id,now)];
   for(let i=0;i<p.occurrences;i++){const tid=crypto.randomUUID(),scheduled=dayISO(p.interval_days*i,new Date(p.start_date+'T12:00:00Z'));stmts.push(database.prepare("INSERT INTO tickets (id,title,description,location,equipment_id,priority,status,kind,creator_id,assignee_id,due_date,scheduled_date,estimated_hours,plan_id,created_at,updated_at) VALUES (?,?,?,?,?,'normal',?,'ppr',?,?,?,?,?,?,?,?)").bind(tid,p.title,p.description,p.location,p.equipment_id,p.assignee_id?'assigned':'new',me.id,p.assignee_id,scheduled,scheduled,p.estimated_hours,pid,now,now));}
   stmts.push(audit(me,null,'plan',`Создан график ППР: ${p.title} · работ: ${p.occurrences}`));await database.batch(stmts);return {ok:true,id:pid};
+ }
+ if(action==='create_inspection'){
+  const p=z.object({equipment_id:id,checklist:str(5,5000),notes:str(0,3000).default(''),status:z.enum(['passed','attention','failed'])}).parse(input);
+  await database.prepare('SELECT id FROM equipment WHERE id=?').bind(p.equipment_id).first() || (()=>{throw new PortalError('Оборудование не найдено.',404)})();
+  await database.prepare('INSERT INTO asset_inspections (id,equipment_id,inspector_id,checklist,notes,status,created_at) VALUES (?,?,?,?,?,?,?)').bind(crypto.randomUUID(),p.equipment_id,me.id,p.checklist,p.notes,p.status,now).run();return {ok:true};
+ }
+ if(action==='create_material'){
+  requireManager(me);const p=z.object({name:str(2,180),code:str(2,60),stock:z.number().min(0).max(1000000),min_stock:z.number().min(0).max(1000000),unit:str(1,20)}).parse(input);
+  await database.prepare('INSERT INTO materials (id,name,code,stock,min_stock,unit,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,stock=excluded.stock,min_stock=excluded.min_stock,unit=excluded.unit,updated_at=excluded.updated_at').bind(crypto.randomUUID(),p.name,p.code,p.stock,p.min_stock,p.unit,now).run();return {ok:true};
+ }
+ if(action==='create_energy_reading'){
+  const p=z.object({location:str(2,150),reading_kwh:z.number().min(0).max(100000000),recorded_at:date}).parse(input);
+  await database.prepare('INSERT INTO energy_readings (id,location,reading_kwh,recorded_at,author_id) VALUES (?,?,?,?,?)').bind(crypto.randomUUID(),p.location,p.reading_kwh,p.recorded_at,me.id).run();return {ok:true};
+ }
+ if(action==='create_permit'){
+  requireManager(me);const p=z.object({number:str(2,60),location:str(2,150),work_type:str(2,180),status:z.enum(['draft','active','closed']),responsible_id:id,valid_until:date}).parse(input);await database.prepare("SELECT id FROM users WHERE id=? AND role IN ('electrician','dispatcher','admin')").bind(p.responsible_id).first() || (()=>{throw new PortalError('Ответственный не найден.',404)})();await database.prepare('INSERT INTO work_permits (id,number,location,work_type,status,responsible_id,valid_until,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(crypto.randomUUID(),p.number,p.location,p.work_type,p.status,p.responsible_id,p.valid_until,now).run();return {ok:true};
+ }
+ if(action==='create_incident'){
+  const p=z.object({title:str(5,180),location:str(2,150),severity:z.enum(['critical','high','normal']),status:z.enum(['open','in_progress','closed'])}).parse(input);await database.prepare('INSERT INTO incidents (id,title,location,severity,status,created_by,created_at) VALUES (?,?,?,?,?,?,?)').bind(crypto.randomUUID(),p.title,p.location,p.severity,p.status,me.id,now).run();return {ok:true};
  }
  throw new PortalError('Неизвестное действие.');
 }
